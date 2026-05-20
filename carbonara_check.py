@@ -31,29 +31,50 @@ DAYS = ["Montag", "Dienstag", "Mittwoch", "Donnerstag",
 
 
 def fetch_menu_text() -> str:
-    """Render the SvelteKit page in headless Chromium and return body text."""
+    """Render the SvelteKit page in headless Chromium and return body text.
+
+    Dishes are inside collapsed accordion panels — we expand them via JS
+    (best-effort) and read text_content() so that any items still hidden
+    by CSS are also captured.
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch()
         context = browser.new_context(locale="de-AT")
         page = context.new_page()
         page.goto(MENU_URL, wait_until="networkidle", timeout=30_000)
-        # Give client-side rendering a moment to settle
         page.wait_for_timeout(1500)
-        text = page.locator("body").inner_text()
+
+        # Best-effort: open all accordion-style toggles
+        page.evaluate(
+            """
+            document.querySelectorAll('button[aria-expanded="false"]')
+                .forEach(b => b.click());
+            document.querySelectorAll('details:not([open])')
+                .forEach(d => d.open = true);
+            """
+        )
+        page.wait_for_timeout(500)
+
+        # text_content() includes hidden nodes, unlike inner_text()
+        text = page.locator("body").text_content() or ""
         browser.close()
     return text
 
 
 def parse_days(text: str) -> Dict[str, str]:
-    """Split text into per-day buckets keyed by German weekday name."""
+    """Split text into per-day buckets keyed by German weekday name.
+
+    text_content() returns a single string without newlines, so we split
+    between consecutive day-name occurrences rather than line by line.
+    """
     sections: Dict[str, str] = {d: "" for d in DAYS}
-    pattern = re.compile(rf"\b({'|'.join(DAYS)})\b[^\n]*")
+    pattern = re.compile(rf"\b({'|'.join(DAYS)})\b")
     matches = list(pattern.finditer(text))
     for i, m in enumerate(matches):
         day = m.group(1)
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        sections[day] += text[start:end] + "\n"
+        sections[day] += text[start:end]
     return sections
 
 
