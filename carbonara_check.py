@@ -33,30 +33,81 @@ DAYS = ["Montag", "Dienstag", "Mittwoch", "Donnerstag",
 def fetch_menu_text() -> str:
     """Render the SvelteKit page in headless Chromium and return body text.
 
-    Dishes are inside collapsed accordion panels — we expand them via JS
-    (best-effort) and read text_content() so that any items still hidden
-    by CSS are also captured.
+    The dishes live inside accordion panels that may lazy-render their
+    content only after the toggle is clicked. We try several expansion
+    strategies and dump diagnostic output so failures are easy to debug.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch()
         context = browser.new_context(locale="de-AT")
         page = context.new_page()
         page.goto(MENU_URL, wait_until="networkidle", timeout=30_000)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2000)  # let SvelteKit hydrate
 
-        # Best-effort: open all accordion-style toggles
-        page.evaluate(
-            """
-            document.querySelectorAll('button[aria-expanded="false"]')
-                .forEach(b => b.click());
-            document.querySelectorAll('details:not([open])')
-                .forEach(d => d.open = true);
-            """
+        # Multi-strategy expansion: try standard a11y patterns first, then
+        # fall back to clicking anything that looks like a day heading.
+        diag = page.evaluate(
+            """() => {
+                const days = ['Montag','Dienstag','Mittwoch','Donnerstag',
+                              'Freitag','Samstag','Sonntag'];
+                const log = {ariaToggles: 0, details: 0, dayHeadings: 0};
+
+                // 1. Standard aria-expanded toggles
+                const ariaToggles = document.querySelectorAll(
+                    '[aria-expanded="false"]'
+                );
+                log.ariaToggles = ariaToggles.length;
+                ariaToggles.forEach(el => { try { el.click(); } catch(e) {} });
+
+                // 2. <details> elements
+                const details = document.querySelectorAll('details:not([open])');
+                log.details = details.length;
+                details.forEach(d => d.open = true);
+
+                // 3. Click elements whose text starts with a day name.
+                //    Only run if strategies 1 and 2 didn't find anything,
+                //    otherwise we risk toggling things back closed.
+                if (log.ariaToggles === 0 && log.details === 0) {
+                    const headings = [];
+                    document.querySelectorAll(
+                        'h1,h2,h3,h4,h5,button,[role="button"],div,a'
+                    ).forEach(el => {
+                        const text = (el.textContent || '').trim();
+                        if (text.length === 0 || text.length > 60) return;
+                        if (!days.some(d => text.startsWith(d))) return;
+                        // Skip if a child element also matches (prefer
+                        // the most specific element).
+                        const childMatches = Array.from(el.children).some(c => {
+                            const ct = (c.textContent || '').trim();
+                            return ct.length < 60 &&
+                                   days.some(d => ct.startsWith(d));
+                        });
+                        if (childMatches) return;
+                        headings.push(el);
+                    });
+                    log.dayHeadings = headings.length;
+                    headings.forEach(el => {
+                        try { el.click(); } catch(e) {}
+                    });
+                }
+                return log;
+            }"""
         )
-        page.wait_for_timeout(500)
+        print(f"Expansion strategies: {diag}")
+        page.wait_for_timeout(2000)  # wait for content to render after clicks
 
-        # text_content() includes hidden nodes, unlike inner_text()
         text = page.locator("body").text_content() or ""
+
+        # Diagnostics — printed on every run so the Actions log shows
+        # exactly what was scraped.
+        print(f"Body text length: {len(text)}")
+        print(f"Contains 'carbonara': {'carbonara' in text.lower()}")
+        for day in DAYS:
+            if day in text:
+                idx = text.find(day)
+                snippet = text[idx:idx + 200].replace("\n", " ")
+                print(f"  {day}: {snippet!r}")
+
         browser.close()
     return text
 
